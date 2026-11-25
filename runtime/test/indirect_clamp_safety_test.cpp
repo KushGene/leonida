@@ -37,6 +37,20 @@ struct BufferRecord {
     VkDeviceSize size = 0;
 };
 
+struct FillRecord {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceSize offset = 0;
+    VkDeviceSize size = 0;
+    std::uint32_t data = 0;
+};
+
+struct BarrierRecord {
+    VkPipelineStageFlags src_stage = 0;
+    VkPipelineStageFlags dst_stage = 0;
+    VkAccessFlags src_access = 0;
+    VkAccessFlags dst_access = 0;
+};
+
 struct MockState {
     std::mutex mutex;
     std::uint64_t next_handle = 1;
@@ -45,10 +59,15 @@ struct MockState {
     int free_memory_calls = 0;
     int create_buffer_calls = 0;
     int destroy_buffer_calls = 0;
+    int copy_buffer_calls = 0;
     std::unordered_map<std::uintptr_t, BufferRecord> buffers;
     std::unordered_map<std::uintptr_t, std::uint32_t> mem_types;
+    std::unordered_map<std::uintptr_t, VkMemoryAllocateFlags> mem_alloc_flags;
+    std::unordered_map<std::uintptr_t, VkMemoryAllocateFlags> buffer_alloc_flags;
     std::unordered_map<std::uintptr_t, std::unique_ptr<std::uint8_t[]>> host_maps;
     std::unordered_map<std::uintptr_t, std::uint8_t*> buffer_host;
+    std::vector<FillRecord> fills;
+    std::vector<BarrierRecord> barriers;
 };
 
 MockState* g_mock = nullptr;
@@ -78,6 +97,7 @@ VKAPI_ATTR void VKAPI_CALL mock_destroy_buffer(VkDevice, VkBuffer buffer, const 
     std::lock_guard lock(g_mock->mutex);
     ++g_mock->destroy_buffer_calls;
     g_mock->buffers.erase(reinterpret_cast<std::uintptr_t>(buffer));
+    g_mock->buffer_alloc_flags.erase(reinterpret_cast<std::uintptr_t>(buffer));
     g_mock->buffer_host.erase(reinterpret_cast<std::uintptr_t>(buffer));
 }
 
@@ -95,7 +115,13 @@ VKAPI_ATTR VkResult VKAPI_CALL mock_allocate_memory(VkDevice, const VkMemoryAllo
     std::lock_guard lock(g_mock->mutex);
     ++g_mock->alloc_memory_calls;
     const auto id = ++g_mock->next_handle;
+    VkMemoryAllocateFlags flags = 0;
+    for (const auto* next = static_cast<const VkBaseInStructure*>(info->pNext); next; next = next->pNext) {
+        if (next->sType == VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO)
+            flags |= reinterpret_cast<const VkMemoryAllocateFlagsInfo*>(next)->flags;
+    }
     g_mock->mem_types[static_cast<std::uintptr_t>(id)] = info->memoryTypeIndex;
+    g_mock->mem_alloc_flags[static_cast<std::uintptr_t>(id)] = flags;
     g_mock->host_maps[static_cast<std::uintptr_t>(id)] = std::make_unique<std::uint8_t[]>(size_t(info->allocationSize));
     std::memset(g_mock->host_maps[static_cast<std::uintptr_t>(id)].get(), 0, size_t(info->allocationSize));
     *out = make_handle<VkDeviceMemory>(id);
@@ -106,6 +132,7 @@ VKAPI_ATTR void VKAPI_CALL mock_free_memory(VkDevice, VkDeviceMemory mem, const 
     std::lock_guard lock(g_mock->mutex);
     ++g_mock->free_memory_calls;
     g_mock->mem_types.erase(reinterpret_cast<std::uintptr_t>(mem));
+    g_mock->mem_alloc_flags.erase(reinterpret_cast<std::uintptr_t>(mem));
     g_mock->host_maps.erase(reinterpret_cast<std::uintptr_t>(mem));
 }
 
@@ -114,6 +141,9 @@ VKAPI_ATTR VkResult VKAPI_CALL mock_bind_buffer_memory(VkDevice, VkBuffer buffer
     const auto it = g_mock->mem_types.find(reinterpret_cast<std::uintptr_t>(mem));
     if (it != g_mock->mem_types.end() && it->second == g_mock->fail_bind_type)
         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    const auto fit = g_mock->mem_alloc_flags.find(reinterpret_cast<std::uintptr_t>(mem));
+    g_mock->buffer_alloc_flags[reinterpret_cast<std::uintptr_t>(buffer)] =
+        fit != g_mock->mem_alloc_flags.end() ? fit->second : 0;
     const auto mit = g_mock->host_maps.find(reinterpret_cast<std::uintptr_t>(mem));
     if (mit != g_mock->host_maps.end()) g_mock->buffer_host[reinterpret_cast<std::uintptr_t>(buffer)] = mit->second.get();
     return VK_SUCCESS;
@@ -166,17 +196,31 @@ VKAPI_ATTR VkResult VKAPI_CALL mock_create_compute_pipelines(VkDevice, VkPipelin
 }
 VKAPI_ATTR void VKAPI_CALL mock_destroy_pipeline(VkDevice, VkPipeline, const VkAllocationCallbacks*) {}
 
-VKAPI_ATTR void VKAPI_CALL mock_cmd_pipeline_barrier(VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags,
-                                                     VkDependencyFlags, std::uint32_t, const VkMemoryBarrier*,
+VKAPI_ATTR void VKAPI_CALL mock_cmd_pipeline_barrier(VkCommandBuffer, VkPipelineStageFlags src_stage,
+                                                     VkPipelineStageFlags dst_stage, VkDependencyFlags,
+                                                     std::uint32_t memory_count, const VkMemoryBarrier* memory_barriers,
                                                      std::uint32_t, const VkBufferMemoryBarrier*, std::uint32_t,
-                                                     const VkImageMemoryBarrier*) {}
+                                                     const VkImageMemoryBarrier*) {
+    std::lock_guard lock(g_mock->mutex);
+    for (std::uint32_t i = 0; i < memory_count; ++i) {
+        g_mock->barriers.push_back(
+            {src_stage, dst_stage, memory_barriers[i].srcAccessMask, memory_barriers[i].dstAccessMask});
+    }
+}
 VKAPI_ATTR void VKAPI_CALL mock_cmd_bind_pipeline(VkCommandBuffer, VkPipelineBindPoint, VkPipeline) {}
 VKAPI_ATTR void VKAPI_CALL mock_cmd_push_constants(VkCommandBuffer, VkPipelineLayout, VkShaderStageFlags, std::uint32_t,
                                                    std::uint32_t, const void*) {}
 VKAPI_ATTR void VKAPI_CALL mock_cmd_dispatch(VkCommandBuffer, std::uint32_t, std::uint32_t, std::uint32_t) {}
-VKAPI_ATTR void VKAPI_CALL mock_cmd_fill_buffer(VkCommandBuffer, VkBuffer, VkDeviceSize, VkDeviceSize, std::uint32_t) {}
+VKAPI_ATTR void VKAPI_CALL mock_cmd_fill_buffer(VkCommandBuffer, VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size,
+                                              std::uint32_t data) {
+    std::lock_guard lock(g_mock->mutex);
+    g_mock->fills.push_back({buffer, offset, size, data});
+}
 VKAPI_ATTR void VKAPI_CALL mock_cmd_copy_buffer(VkCommandBuffer, VkBuffer, VkBuffer, std::uint32_t,
-                                                const VkBufferCopy*) {}
+                                                const VkBufferCopy*) {
+    std::lock_guard lock(g_mock->mutex);
+    ++g_mock->copy_buffer_calls;
+}
 
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL mock_get_device_proc_addr(VkDevice, const char* name) {
 #define ENTRY(fn_name, impl) \
@@ -408,6 +452,63 @@ int main() {
         }
         done.store(true, std::memory_order_release);
         releaser.join();
+    }
+
+    // 6. Direct-BDA HostArea stats, single list_budget fill per command list, zero per-call copies, and narrow barriers.
+    {
+        MockState state;
+        g_mock = &state;
+        IndirectArgumentClamp clamp(mock_get_device_proc_addr, dummy_device, make_memory_props(), make_limits(),
+                                    make_scratch_allocator());
+        const VkCommandBuffer dummy_cb = make_handle<VkCommandBuffer>(0x300);
+        auto batch = clamp.batch();
+        ClampedIndirect jobs[3]{};
+        VkDeviceAddress shared = 0;
+        for (int i = 0; i < 3; ++i) {
+            CHECK(batch->prepare(args_buf, 0, VK_NULL_HANDLE, 0, indirect_clamp_draw, 16, 1, jobs[i]));
+            jobs[i].share_list_budget(shared);
+        }
+        const VkBuffer area_buf = jobs[0].stats_buffer;
+        const VkBufferUsageFlags want_usage =
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        CHECK((state.buffers.at(reinterpret_cast<std::uintptr_t>(area_buf)).usage & want_usage) == want_usage);
+        CHECK((state.buffer_alloc_flags.at(reinterpret_cast<std::uintptr_t>(area_buf)) &
+               VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT) != 0);
+        CHECK(jobs[0].stats != jobs[1].stats && jobs[1].stats != jobs[2].stats);
+
+        for (int i = 0; i < 3; ++i) clamp.emit(dummy_cb, jobs[i]);
+        CHECK(state.fills.size() == 1);
+        CHECK(state.fills[0].buffer == jobs[0].buffer && state.fills[0].size == sizeof(std::uint32_t) &&
+              state.fills[0].data == 0);
+        CHECK(state.copy_buffer_calls == 0);
+        CHECK(state.barriers.size() == 6);
+        for (std::size_t i = 0; i < 3; ++i) {
+            const BarrierRecord& before = state.barriers[2 * i];
+            const BarrierRecord& done = state.barriers[2 * i + 1];
+            CHECK(before.src_stage == VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+            CHECK(before.dst_stage == VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+            CHECK(before.src_access == (VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT));
+            CHECK(before.dst_access == (VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT));
+            CHECK(done.src_stage == VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+            CHECK(done.dst_stage == (VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT));
+            CHECK(done.src_access == VK_ACCESS_SHADER_WRITE_BIT);
+            CHECK(done.dst_access == (VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT));
+        }
+
+        // Uncounted standalone call (> 4096 slots) owns its own list budget and still performs no copy-back.
+        state.fills.clear();
+        state.barriers.clear();
+        state.copy_buffer_calls = 0;
+        std::vector<ClampedIndirect> overflow(4096);
+        for (auto& job : overflow)
+            CHECK(batch->prepare(args_buf, 0, VK_NULL_HANDLE, 0, indirect_clamp_draw, 16, 1, job));
+        CHECK(overflow.back().stats_buffer == VK_NULL_HANDLE);
+        clamp.emit(dummy_cb, overflow.back());
+        CHECK(state.fills.size() == 1 && state.fills[0].size == sizeof(std::uint32_t));
+        CHECK(state.copy_buffer_calls == 0);
+        CHECK(state.barriers.size() == 2);
+        clamp.retire(VK_NULL_HANDLE, 0);
+        clamp.collect();
     }
 
     std::printf("indirect_clamp_safety_test: all checks passed\n");

@@ -108,15 +108,22 @@ struct ClampedIndirect {
     VkDeviceAddress stats = 0;
     VkDeviceAddress list_budget = 0;
     void share_list_budget(VkDeviceAddress& first) {
-        if (!first) first = list_budget;
-        list_budget = first;
+        if (!first) {
+            first = list_budget;
+            owns_list_budget = true;
+        } else {
+            list_budget = first;
+            owns_list_budget = false;
+        }
     }
-    VkBuffer stats_buffer = VK_NULL_HANDLE;  // the host-visible counter slot the pass copies its counters to
+    VkBuffer stats_buffer = VK_NULL_HANDLE;  // the host-visible counter buffer storing this call's slot
     VkDeviceSize stats_offset = 0;
-    VkDeviceSize stats_scratch_offset = 0;  // where in `buffer` the pass's own counters are
+    VkDeviceSize stats_scratch_offset = 0;  // where in `buffer` the fallback counter area sits when uncounted
+    VkDeviceSize budget_scratch_offset = 0; // where in `buffer` this list's 4-byte budget word sits
     std::uint32_t kind = 0;
     std::uint32_t stride_words = 0;
     std::uint32_t max_records = 0;
+    bool owns_list_budget = true;
 };
 
 // One device's clamp: the pass's pipeline (made on the first call), the per-submission record pool, and the counter
@@ -210,8 +217,8 @@ public:
 
     std::unique_ptr<Batch> batch() { return std::make_unique<Batch>(*this); }
 
-    // Records one clamp pass: its counters filled, the dispatch, and the counters copied back to their slot. Emitted
-    // before the indirect command that reads `job`, and before any rendering scope that command runs in.
+    // Records one clamp pass: zeros the command list's shared budget once, dispatches the clamp, and orders its writes
+    // for the indirect command. Emitted before the indirect command that reads `job`, and before any rendering scope.
     void emit(VkCommandBuffer cb, const ClampedIndirect& job);
 
     Counters counters() const {
@@ -220,10 +227,11 @@ public:
     }
 
 private:
-    // A host-visible buffer of counter slots: what the pass's counters are copied into, 16 bytes each.
+    // A host-visible buffer of counter slots: the shader writes the pass's counters directly via device address.
     struct HostArea {
         VkBuffer buffer = VK_NULL_HANDLE;
         VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkDeviceAddress address = 0;
         std::uint8_t* host = nullptr;
         std::uint32_t slots = 0;
         static constexpr std::uint32_t slot_bytes = 32;  // 16 bytes of counters, 16 of padding
@@ -313,7 +321,7 @@ inline bool IndirectArgumentClamp::make_pipeline() {
              "vkAllocateMemory", "vkFreeMemory", "vkBindBufferMemory", "vkMapMemory", "vkUnmapMemory",
              "vkGetBufferDeviceAddress", "vkCreateShaderModule", "vkDestroyShaderModule", "vkCreatePipelineLayout",
              "vkDestroyPipelineLayout", "vkCreateComputePipelines", "vkDestroyPipeline", "vkCmdPipelineBarrier",
-             "vkCmdBindPipeline", "vkCmdPushConstants", "vkCmdDispatch", "vkCmdFillBuffer", "vkCmdCopyBuffer"})
+             "vkCmdBindPipeline", "vkCmdPushConstants", "vkCmdDispatch", "vkCmdFillBuffer"})
         if (!get_(device_, name)) return false;
     VkShaderModule module = VK_NULL_HANDLE;
     VkShaderModuleCreateInfo shader{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
@@ -348,7 +356,7 @@ inline bool IndirectArgumentClamp::make_pipeline() {
     return true;
 }
 
-// One host-visible buffer of counter slots: a coherent mapping the pass's counters are copied into.
+// One host-visible buffer of counter slots: a coherent mapping written directly by the clamp shader via BDA.
 inline bool IndirectArgumentClamp::make_area() {
     if (areas_.size() >= max_areas) return false;
     const auto create_buffer = fn<PFN_vkCreateBuffer>("vkCreateBuffer");
@@ -356,14 +364,16 @@ inline bool IndirectArgumentClamp::make_area() {
     const auto bind_fn = fn<PFN_vkBindBufferMemory>("vkBindBufferMemory");
     const auto allocate_fn = fn<PFN_vkAllocateMemory>("vkAllocateMemory");
     const auto map_fn = fn<PFN_vkMapMemory>("vkMapMemory");
-    if (!create_buffer || !requirements_fn || !bind_fn || !allocate_fn || !map_fn || !memory_.memoryTypeCount)
+    const auto bda_fn = fn<PFN_vkGetBufferDeviceAddress>("vkGetBufferDeviceAddress");
+    if (!create_buffer || !requirements_fn || !bind_fn || !allocate_fn || !map_fn || !bda_fn ||
+        !memory_.memoryTypeCount)
         return false;
     HostArea area{};
     area.slots = slots_per_area;
     VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     info.size = VkDeviceSize(area.slots) * HostArea::slot_bytes;
-    info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    // Direct and async-compute queues copy counter slots into the same HostArea buffer concurrently.
+    info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    // Direct and async-compute queues write counter slots in the same HostArea buffer concurrently.
     share_across_queue_families(info, families_);
     if (create_buffer(device_, &info, nullptr, &area.buffer) != VK_SUCCESS) return false;
     const auto destroy_buffer = fn<PFN_vkDestroyBuffer>("vkDestroyBuffer");
@@ -376,7 +386,9 @@ inline bool IndirectArgumentClamp::make_area() {
     };
     VkMemoryRequirements requirements{};
     requirements_fn(device_, area.buffer, &requirements);
-    VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    VkMemoryAllocateFlagsInfo alloc_flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+    alloc_flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+    VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &alloc_flags};
     allocation.allocationSize = requirements.size;
     bool bound = false;
     for (const std::uint32_t type : memory_type_order(memory_, requirements.memoryTypeBits,
@@ -394,6 +406,13 @@ inline bool IndirectArgumentClamp::make_area() {
         area.memory = VK_NULL_HANDLE;
     }
     if (!bound || map_fn(device_, area.memory, 0, info.size, 0, reinterpret_cast<void**>(&area.host)) != VK_SUCCESS) {
+        cleanup();
+        return false;
+    }
+    VkBufferDeviceAddressInfo bda_info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+    bda_info.buffer = area.buffer;
+    area.address = bda_fn(device_, &bda_info);
+    if (!area.address) {
         cleanup();
         return false;
     }
@@ -541,13 +560,21 @@ inline bool IndirectArgumentClamp::prepare(VkBuffer arguments, VkDeviceSize argu
     out.count = count_va ? count_va + count_offset : 0;
     out.records_out = address;
     out.count_out = address + count_scratch;
-    out.stats = address + stats_scratch;
-    out.list_budget = out.stats + 4 * sizeof(std::uint32_t);
+    out.list_budget = address + stats_scratch + 4 * sizeof(std::uint32_t);
     out.stats_scratch_offset = offset + stats_scratch;
+    out.budget_scratch_offset = offset + stats_scratch + 4 * sizeof(std::uint32_t);
+    out.owns_list_budget = true;
     out.stats_offset = slot.area == no_slot ? 0 : VkDeviceSize(slot.index) * HostArea::slot_bytes;
     {
         std::lock_guard lock(mutex_);
-        out.stats_buffer = slot.area == no_slot ? VK_NULL_HANDLE : areas_[slot.area].buffer;  // no_slot: no copy-back
+        if (slot.area != no_slot) {
+            const HostArea& area = areas_[slot.area];
+            out.stats_buffer = area.buffer;
+            out.stats = area.address + out.stats_offset;
+        } else {
+            out.stats_buffer = VK_NULL_HANDLE;
+            out.stats = address + stats_scratch;
+        }
         ++counters_.calls;
         counters_.records += max_count;
     }
@@ -559,11 +586,14 @@ inline void IndirectArgumentClamp::emit(VkCommandBuffer cb, const ClampedIndirec
     const auto bind = fn<PFN_vkCmdBindPipeline>("vkCmdBindPipeline");
     const auto push = fn<PFN_vkCmdPushConstants>("vkCmdPushConstants");
     const auto dispatch = fn<PFN_vkCmdDispatch>("vkCmdDispatch");
-    // The counters start at zero: the budget's compare-and-swap and the record counts accumulate into them. A
-    // transfer write, ordered to the compute stage by the barrier below, like the arguments' own writes.
-    fn<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(cb, job.buffer, job.stats_scratch_offset, job.list_budget == job.stats + 16 ? 20 : 16, 0);
+    // Only the first call in a command list owns the shared list budget; counter slots in HostArea are already
+    // zeroed on the CPU (HOST_COHERENT) before submission.
+    if (job.owns_list_budget)
+        fn<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(cb, job.buffer, job.budget_scratch_offset, sizeof(std::uint32_t), 0);
+    // Order earlier shader/transfer writes to the arguments, count buffer, and shared list_budget before the clamp
+    // shader reads/updates them; omit MEMORY_WRITE so graphics color/depth caches are not flushed.
     VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-    before.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;  // every earlier write: the compute that wrote these arguments
+    before.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
     before.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
     barrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &before, 0, nullptr, 0,
             nullptr);
@@ -594,20 +624,12 @@ inline void IndirectArgumentClamp::emit(VkCommandBuffer cb, const ClampedIndirec
         dispatch(cb, (records - 1u) / 64u + 1u, 1, 1);
         first += records;
     }
-    if (job.stats_buffer) {  // none for a call clamped without a counter slot
-        VkMemoryBarrier after_copy{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-        after_copy.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        after_copy.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-        barrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &after_copy, 0, nullptr,
-                0, nullptr);
-        VkBufferCopy copy{job.stats_scratch_offset, job.stats_offset, 4 * sizeof(std::uint32_t)};
-        fn<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(cb, job.buffer, job.stats_buffer, 1, &copy);
-    }
-    // The indirect command reads the records, and nothing else may read them while it does.
+    // Order the clamped records and count word for the indirect command (and transfer readbacks in tests) without
+    // stalling unrelated graphics/compute stages or flushing colour/depth caches.
     VkMemoryBarrier done{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-    done.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
-    done.dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_MEMORY_READ_BIT;
-    barrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &done, 0, nullptr, 0,
-            nullptr);
+    done.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    done.dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+    barrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &done, 0, nullptr, 0, nullptr);
 }
 }  // namespace leonida
