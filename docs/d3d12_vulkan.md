@@ -751,7 +751,8 @@ side inwards:
   their mapping to Vulkan formats, view types, component mappings and samplers. Field positions are Mesa's
   (`src/amd/registers/gfx10-rsrc.json`) and agree with what the translator and the GPU tests already use. Bits
   that only the console's driver could give a meaning (tiling, compression metadata, performance hints) are
-  written as zero.
+  written as zero. A title-written linear 1D/2D/2D_MSAA T# carries its row pitch in `WORD4 DEPTH` (with `PITCH_MSB`
+  at bit 13) instead of the last layer; `decode()` reads it when `SW_MODE` is 0 (docs/design.md, "Linear 1D/2D T# pitch").
 - **Device**: `CreateShaderResourceView` and `CreateUnorderedAccessView` of textures write a T# into the slot,
   `CreateSampler` an S#; each then makes sure set 0 has the view or sampler and the table has the key. Details:
   - The key is the descriptor's bytes, so a copied descriptor needs nothing more. An SRV and UAV with identical

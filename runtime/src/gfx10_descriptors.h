@@ -116,9 +116,13 @@ struct Image {
 //   WORD1  BASE_ADDRESS_HI [7:0] = address >> 40, MIN_LOD [19:8] (4.8 fixed), FORMAT [28:20], WIDTH_LO [31:30]
 //   WORD2  WIDTH_HI [11:0], HEIGHT [27:14]                     (width - 1 and height - 1)
 //   WORD3  DST_SEL_X/Y/Z/W [11:0], BASE_LEVEL [15:12], LAST_LEVEL [19:16], TYPE [31:28]
-//   WORD4  DEPTH [12:0] = depth - 1 for 3D, else the last layer; BASE_ARRAY [28:16] = the first layer
+//   WORD4  DEPTH [12:0] = depth - 1 for 3D, else the last layer; BASE_ARRAY [28:16] = the first layer.
+//          On GFX10.3+ a linear 1D, 2D or 2D_MSAA image carries its row pitch - 1 here instead, with
+//          PITCH_MSB at bit 13 (Mesa ac_set_mutable_tex_desc_fields; tools/hw_oracle/tsharp.py writes it).
 //   WORD5  MAX_MIP [7:4] = resource mips - 1
 // A multisampled image has BASE_LEVEL 0 and log2(samples) in LAST_LEVEL and MAX_MIP.
+// A linear 1D/2D/2D_MSAA image's pitch (WORD4 DEPTH, PITCH_MSB) is read by decode() but not written here: the
+// layer's own T#s name tiled Vulkan views, and a title's linear T# is only decoded.
 inline ImageWords encode(const Image& image) {
     using detail::field;
     const bool msaa = multisampled(image.type);
@@ -184,7 +188,8 @@ inline constexpr float image_min_lod(const ImageWords& words) {
 }
 
 // False when the dwords are not an image descriptor, or a field contradicts another: a reserved DST_SEL, a last
-// level or layer before the first, or a cube whose layers are not whole cubes.
+// level or layer before the first (for a tiled image; a linear 1D/2D/2D_MSAA image's DEPTH is a pitch), or a cube
+// whose layers are not whole cubes.
 inline bool decode(const ImageWords& words, Image& out) {
     using detail::get;
     if (!is_image(words)) return false;
@@ -211,7 +216,19 @@ inline bool decode(const ImageWords& words, Image& out) {
 
     const std::uint32_t last = get(words[4], 0, 13);
     image.first_layer = get(words[4], 16, 13);
-    if (image.type == ImageType::image_3d) {
+    // On GFX10.3+ a linear 1D, 2D or 2D_MSAA image carries its row pitch - 1 in DEPTH, with PITCH_MSB at bit 13,
+    // instead of the last layer (Mesa ac_set_mutable_tex_desc_fields). SW_MODE (word 3 bits 24:20) is 0 for a
+    // linear image and non-zero for a tiled one. A tiled 1D/2D image has first_layer == 0 and DEPTH == 0; a linear
+    // one writes a pitch above one element (a one-element pitch is already one layer). A block-compressed pitch is
+    // counted in blocks, so it can be below the width in texels. Reading the pitch as layers made a 1920-wide
+    // linear texture a 1920-layer array, which bind_title_image refuses as "no view for the T#'s format or range".
+    const std::uint64_t pitch = (std::uint64_t(last) | (std::uint64_t(get(words[4], 13, 1)) << 13)) + 1;
+    const bool linear = (image.type == ImageType::image_1d || image.type == ImageType::image_2d ||
+                         image.type == ImageType::image_2d_msaa) &&
+                        get(words[3], 20, 5) == 0 && image.first_layer == 0 && pitch > 1;
+    if (linear) {
+        image.layer_count = 1;
+    } else if (image.type == ImageType::image_3d) {
         image.depth = last + 1;
     } else {
         if (last < image.first_layer) return false;

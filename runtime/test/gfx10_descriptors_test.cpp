@@ -133,8 +133,9 @@ int main() {
     const auto array_range = vulkan_subresource_range(images[2], VK_IMAGE_ASPECT_COLOR_BIT);
     CHECK(array_range.baseArrayLayer == 3 && array_range.layerCount == 7);
 
-    // Bits this header does not encode are ignored: SW_MODE and BC_SWIZZLE (word 3), PITCH_MSB (word 4), PERF_MOD
-    // and the rest of word 5, the compression and metadata fields of words 6 and 7, RESOURCE_LEVEL (word 2 bit 31).
+    // Bits this header does not encode are ignored for this cube: SW_MODE and BC_SWIZZLE (word 3), PITCH_MSB
+    // (word 4; it matters only for a linear 1D/2D image, below), PERF_MOD and the rest of word 5, the compression
+    // and metadata fields of words 6 and 7, RESOURCE_LEVEL (word 2 bit 31).
     ImageWords busy = encode(images[3]);
     busy[2] |= 0x80000000;
     busy[3] |= 0x0FF00000;
@@ -143,6 +144,61 @@ int main() {
     busy[6] = busy[7] = 0xFFFFFFFF;
     Image decoded{};
     CHECK(decode(busy, decoded) && decoded == images[3]);
+
+    // A linear 1D/2D/2D_MSAA T# carries its row pitch - 1 in WORD4 DEPTH, with PITCH_MSB at bit 13, and SW_MODE 0
+    // (Mesa ac_set_mutable_tex_desc_fields, GFX10.3+). At 4 bytes per texel a 1920-wide RGBA8 image has a
+    // 1920-texel pitch, so its words read as a 1,920-layer array unless the pitch is read as a pitch.
+    Image linear{};
+    linear.format = 56;
+    linear.width = 1920;
+    linear.height = 1080;
+    ImageWords linear_words = encode(linear);
+    linear_words[3] &= ~(0x1Fu << 20);  // SW_MODE 0: linear
+    linear_words[4] = 1920 - 1;         // DEPTH = pitch - 1, PITCH_MSB 0
+    Image decoded_linear{};
+    CHECK(decode(linear_words, decoded_linear));
+    CHECK(decoded_linear.layer_count == 1 && decoded_linear.first_layer == 0);
+    CHECK(decoded_linear == linear);
+
+    // A pitch above 8192 texels uses PITCH_MSB: a 16384-wide RGBA8 image has a 16384-texel pitch.
+    linear.width = 16384;
+    linear_words = encode(linear);
+    linear_words[3] &= ~(0x1Fu << 20);
+    linear_words[4] = ((16384 - 1) & 0x1FFFu) | ((((16384 - 1) >> 13) & 1u) << 13);
+    CHECK(decode(linear_words, decoded_linear));
+    CHECK(decoded_linear.layer_count == 1 && decoded_linear.width == 16384);
+    CHECK(decoded_linear == linear);
+
+    // A block-compressed linear image's pitch is in blocks: 256 blocks is a 1024-texel BC1 row, below the width in
+    // texels, so the pitch cannot be recognised by comparing it with the width.
+    ImageWords blocks = encode(Image{.format = format_from_vulkan(VK_FORMAT_BC1_RGBA_UNORM_BLOCK),
+                                     .width = 1024, .height = 1024});
+    blocks[3] &= ~(0x1Fu << 20);  // SW_MODE 0: linear
+    blocks[4] = 256 - 1;          // 256 blocks of 4 texels
+    CHECK(decode(blocks, decoded_linear));
+    CHECK(decoded_linear.layer_count == 1 && decoded_linear.width == 1024);
+
+    // The same DEPTH on a 2D array is a layer count, not a pitch.
+    Image array{};
+    array.type = ImageType::image_2d_array;
+    array.format = 56;
+    array.width = 1920;
+    array.height = 1080;
+    array.layer_count = 1920;
+    CHECK(decode(encode(array), decoded_linear));
+    CHECK(decoded_linear.layer_count == 1920 && decoded_linear.type == ImageType::image_2d_array);
+
+    // A tiled 2D image (SW_MODE != 0) keeps DEPTH as its last layer, even when that value is large; a 2D view of an
+    // array slice has BASE_ARRAY.
+    ImageWords tiled = encode(Image{.format = 56, .width = 1920, .height = 1080});
+    tiled[3] |= 1u << 20;  // SW_MODE 1: tiled
+    tiled[4] = 5;          // last layer 5 (six layers, if this were an array)
+    CHECK(decode(tiled, decoded_linear));
+    CHECK(decoded_linear.layer_count == 6 && decoded_linear.first_layer == 0);
+    ImageWords slice = encode(Image{.format = 56, .width = 64, .height = 64, .first_layer = 5});
+    slice[4] = (5u << 16) | 5u;  // BASE_ARRAY 5, last layer 5
+    CHECK(decode(slice, decoded_linear));
+    CHECK(decoded_linear.first_layer == 5 && decoded_linear.layer_count == 1);
 
     // Refusals. A failed decode leaves its output alone.
     const Image untouched = decoded;
